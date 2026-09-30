@@ -6,7 +6,13 @@ from slowapi.errors import RateLimitExceeded
 from sqlalchemy import create_engine, Column, Integer, Float, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from pydantic import BaseModel, Field
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import asyncio
+import logging
 import math
 import os
 
@@ -50,12 +56,38 @@ class PointAggrege(BaseModel):
     avg_noise: Optional[float]
     weight: float
 
+RETENTION_HOURS = 12  # Durée de conservation annoncée dans la politique de confidentialité
+PURGE_INTERVAL_SECONDS = 10 * 60
+
+def purge_old_evaluations():
+    db = SessionLocal()
+    try:
+        cutoff = utcnow() - timedelta(hours=RETENTION_HOURS)
+        db.query(Evaluation).filter(Evaluation.timestamp < cutoff).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logging.exception("Échec de la suppression des anciennes évaluations")
+    finally:
+        db.close()
+
+async def purge_loop():
+    while True:
+        await run_in_threadpool(purge_old_evaluations)
+        await asyncio.sleep(PURGE_INTERVAL_SECONDS)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(purge_loop())
+    yield
+    task.cancel()
+
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Sensitive API")
+app = FastAPI(title="Sensitive API", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-RATE_LIMIT_SECONDS = 10 * 60
+RATE_LIMIT_SECONDS = 60
 GRID_CELL = 0.0005  # Half a 111m grid cell width
 
 def get_db():
@@ -186,3 +218,9 @@ def places_details(request: Request, place_id: str):
         timeout=5,
     )
     return resp.json()
+# --- POLITIQUE DE CONFIDENTIALITÉ (lien demandé par Google Play) ---
+PRIVACY_HTML = (Path(__file__).parent / "privacy.html").read_text(encoding="utf-8")
+
+@app.get("/privacy", response_class=HTMLResponse, include_in_schema=False)
+def privacy_policy():
+    return PRIVACY_HTML
